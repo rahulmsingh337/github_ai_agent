@@ -1,0 +1,151 @@
+name: 🔧 Error-Fix Agent
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: write
+  checks: write
+
+jobs:
+  error-fix:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: error-fix-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          pip install ruff mypy 2>/dev/null || true
+
+      - name: TypeScript check
+        id: ts_check
+        run: |
+          if npx tsc --noEmit 2>&1 | tee /tmp/ts-errors.txt; then
+            echo "errors=0" >> $GITHUB_OUTPUT
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            ERROR_COUNT=$(grep -c "error TS" /tmp/ts-errors.txt || echo "0")
+            echo "errors=$ERROR_COUNT" >> $GITHUB_OUTPUT
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "::error::TypeScript: $ERROR_COUNT compilation error(s) found"
+            # Print first 10 errors as annotations
+            grep "error TS" /tmp/ts-errors.txt | head -10 | while read line; do
+              FILE=$(echo "$line" | grep -oP '(?<=\().*(?=,)' | head -1)
+              echo "::error file=$FILE::$line"
+            done
+          fi
+
+      - name: Build check
+        id: build_check
+        run: |
+          if npm run build 2>&1 | tee /tmp/build-output.txt; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "::error::Build failed — check artifacts for details"
+          fi
+
+      - name: Python syntax check
+        id: py_check
+        run: |
+          PY_FILES=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*")
+          if [ -z "$PY_FILES" ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "no_python=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          if echo "$PY_FILES" | xargs python3 -m py_compile 2>&1 | tee /tmp/py-errors.txt; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "::error::Python syntax errors found"
+          fi
+
+      - name: Secret scan (new files only)
+        id: secret_scan
+        run: |
+          FOUND=false
+          # Get files changed in this push
+          CHANGED=$(git diff HEAD~1 --name-only 2>/dev/null || git show --name-only HEAD | tail -n +2)
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            [ ! -f "$file" ] && continue
+            # AWS key pattern
+            if grep -qE "AKIA[0-9A-Z]{16}" "$file"; then
+              echo "::error file=$file::🚨 Potential AWS Access Key detected"
+              FOUND=true
+            fi
+            # GitHub token pattern
+            if grep -qE "ghp_[A-Za-z0-9]{36}" "$file"; then
+              echo "::error file=$file::🚨 Potential GitHub Token detected"
+              FOUND=true
+            fi
+            # Generic API key pattern
+            if grep -qiE "(api_key|apikey|api-key)\s*[=:\"']\s*[A-Za-z0-9+/]{32,}" "$file"; then
+              echo "::warning file=$file::Potential API key pattern detected — review manually"
+              FOUND=true
+            fi
+            # Anthropic/OpenAI key
+            if grep -qE "sk-[A-Za-z0-9]{32,}" "$file"; then
+              echo "::error file=$file::🚨 Potential AI API key detected"
+              FOUND=true
+            fi
+          done <<< "$CHANGED"
+          echo "found=$FOUND" >> $GITHUB_OUTPUT
+
+      - name: Auto-fix Python with Ruff
+        if: steps.py_check.outputs.success == 'false' && steps.py_check.outputs.no_python != 'true'
+        run: |
+          ruff check . --fix || true
+          ruff format . || true
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No auto-fixable Python issues"
+          else
+            git commit -m "🔧 error-fix: auto-apply Ruff fixes"
+            git push || true
+          fi
+
+      - name: Upload error artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-reports-${{ github.sha }}
+          path: |
+            /tmp/ts-errors.txt
+            /tmp/build-output.txt
+            /tmp/py-errors.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🔧 Error-Fix Agent Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| TypeScript | ${{ steps.ts_check.outputs.success == 'true' && '✅ Pass' || '❌ Fail (' }}${{ steps.ts_check.outputs.errors }}${{ steps.ts_check.outputs.success != 'true' && ' errors)' || '' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ steps.build_check.outputs.success == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Python | ${{ steps.py_check.outputs.success == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets | ${{ steps.secret_scan.outputs.found == 'false' && '✅ Clean' || '🚨 Review Required' }} |" >> $GITHUB_STEP_SUMMARY

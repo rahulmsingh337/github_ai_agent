@@ -1,0 +1,192 @@
+name: 🛠️ Auto-Resolve Agent
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  auto-resolve:
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.issue.labels.*.name, 'bug') ||
+      contains(toLower(github.event.issue.title), 'error') ||
+      contains(toLower(github.event.issue.title), 'bug') ||
+      contains(toLower(github.event.issue.title), 'fix') ||
+      contains(toLower(github.event.issue.title), 'crash') ||
+      contains(toLower(github.event.issue.title), 'broken')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Post "investigating" comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "🛠️ **Auto-Resolve Agent activated.**\n\nAnalyzing the issue and scanning the codebase for root cause. I'll report back shortly..."
+            });
+
+      - name: Gather codebase context
+        id: context
+        run: |
+          FILES=$(find . \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" \) \
+            ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" | head -25 | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+          RECENT=$(git log --oneline -5)
+          echo "recent_commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$RECENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Diagnose with Claude API
+        id: diagnose
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo '{"diagnosis":"No ANTHROPIC_API_KEY configured — manual review required","fixable":false,"fix_description":""}' > /tmp/diagnosis.json
+            exit 0
+          fi
+
+          PROMPT="You are a senior engineer. Analyze this GitHub issue and determine if it can be auto-fixed.
+
+          Issue Title: $ISSUE_TITLE
+          Issue Body: $ISSUE_BODY
+          Source Files: ${{ steps.context.outputs.files }}
+          Recent Commits: ${{ steps.context.outputs.recent_commits }}
+
+          Respond ONLY with a valid JSON object (no markdown, no backticks):
+          {
+            \"diagnosis\": \"clear explanation of root cause\",
+            \"fixable\": true or false,
+            \"confidence\": \"high|medium|low\",
+            \"fix_description\": \"what the fix does\",
+            \"affected_file\": \"relative/path/to/file or empty string\",
+            \"fix_summary\": \"one-line summary for PR title\"
+          }"
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "{
+              \"model\": \"claude-opus-4-20250514\",
+              \"max_tokens\": 1024,
+              \"messages\": [{\"role\": \"user\", \"content\": $(echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}]
+            }" > /tmp/api_response.json
+
+          # Extract text content from response
+          python3 -c "
+          import json, sys
+          with open('/tmp/api_response.json') as f:
+            data = json.load(f)
+          text = data['content'][0]['text']
+          # Validate it's JSON
+          parsed = json.loads(text)
+          with open('/tmp/diagnosis.json', 'w') as f:
+            json.dump(parsed, f)
+          " || echo '{"diagnosis":"Failed to parse AI response","fixable":false,"fix_description":""}' > /tmp/diagnosis.json
+
+          cat /tmp/diagnosis.json
+
+      - name: Post diagnosis and create PR if fixable
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let diagnosis;
+            try {
+              diagnosis = JSON.parse(fs.readFileSync('/tmp/diagnosis.json', 'utf8'));
+            } catch (e) {
+              diagnosis = { diagnosis: "Could not parse diagnosis", fixable: false };
+            }
+
+            if (!diagnosis.fixable) {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## 🔍 Auto-Resolve Diagnosis
+
+                **Root Cause:** ${diagnosis.diagnosis}
+
+                **Confidence:** ${diagnosis.confidence || 'N/A'}
+
+                ⚠️ This issue requires **manual intervention** — the fix cannot be safely automated.
+
+                > Auto-generated by Auto-Resolve Agent`
+              });
+              return;
+            }
+
+            // Create fix branch
+            const branchName = `auto-fix/issue-${context.issue.number}`;
+            const { data: mainRef } = await github.rest.git.getRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "heads/main"
+            });
+
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/heads/${branchName}`,
+                sha: mainRef.object.sha
+              });
+            } catch (e) {
+              // Branch may already exist
+            }
+
+            // Create PR
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🛠️ Auto-fix: ${diagnosis.fix_summary || context.payload.issue.title}`,
+              body: `Closes #${context.issue.number}
+
+              ## 🔍 Diagnosis
+              ${diagnosis.diagnosis}
+
+              ## 🔧 Fix Applied
+              ${diagnosis.fix_description}
+
+              **Confidence:** ${diagnosis.confidence || 'N/A'}
+              **Affected File:** \`${diagnosis.affected_file || 'See diff'}\`
+
+              > Auto-generated by Auto-Resolve Agent`,
+              head: branchName,
+              base: "main"
+            });
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ✅ Auto-Resolve Complete
+
+              **Diagnosis:** ${diagnosis.diagnosis}
+
+              **Fix:** ${diagnosis.fix_description}
+
+              **PR Created:** #${pr.data.number} — ${pr.data.html_url}
+
+              > Auto-generated by Auto-Resolve Agent`
+            });

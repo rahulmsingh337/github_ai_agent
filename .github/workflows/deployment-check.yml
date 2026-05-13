@@ -1,0 +1,75 @@
+name: 🚀 Deployment Check Agent
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  check-deployment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for deployment to complete
+        run: sleep 90
+
+      - name: Check production URL
+        id: prod_check
+        run: |
+          URL="${{ secrets.VERCEL_PROJECT_URL }}"
+          if [ -z "$URL" ]; then
+            echo "healthy=skip" >> $GITHUB_OUTPUT
+            echo "status=no URL configured" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          if [ "$STATUS" = "200" ]; then
+            echo "healthy=true" >> $GITHUB_OUTPUT
+          else
+            echo "healthy=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check staging URL
+        id: staging_check
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+        run: |
+          if [ -z "$STAGING_URL" ]; then
+            echo "status=skip" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$STAGING_URL" || echo "000")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Post commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const healthy = "${{ steps.prod_check.outputs.healthy }}";
+            const httpStatus = "${{ steps.prod_check.outputs.status }}";
+            const stagingStatus = "${{ steps.staging_check.outputs.status }}";
+
+            let state, description;
+            if (healthy === "skip") {
+              state = "success";
+              description = "No deployment URL configured — skipped";
+            } else if (healthy === "true") {
+              state = "success";
+              description = `Production healthy (HTTP ${httpStatus})${stagingStatus !== "skip" ? ` | Staging: ${stagingStatus}` : ""}`;
+            } else {
+              state = "failure";
+              description = `Deployment check failed (HTTP ${httpStatus})`;
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state,
+              description,
+              context: "Deployment Health Check",
+              target_url: "${{ secrets.VERCEL_PROJECT_URL }}"
+            });

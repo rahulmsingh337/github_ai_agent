@@ -1,0 +1,59 @@
+name: 🔧 Auto-Fix Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to fix (defaults to current branch)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install formatters
+        run: |
+          npm ci
+          pip install ruff
+
+      - name: Run Ruff auto-fix
+        run: ruff check . --fix --unsafe-fixes || true
+
+      - name: Run Ruff formatter
+        run: ruff format . || true
+
+      - name: Run Prettier
+        run: npx prettier --write "**/*.{js,jsx,ts,tsx,json,css,md}" || true
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🔧 auto-fix: apply Ruff + Prettier formatting"
+            git push
+          fi
