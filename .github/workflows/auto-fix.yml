@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Branch to fix (defaults to current branch)"
+        description: "Branch to fix (leave empty for current branch)"
         required: false
         default: ""
 
@@ -22,6 +22,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
+        if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -34,17 +35,25 @@ jobs:
 
       - name: Install formatters
         run: |
-          npm ci
-          pip install ruff
+          [ -f package-lock.json ] && npm ci || true
+          pip install ruff --quiet
 
       - name: Run Ruff auto-fix
-        run: ruff check . --fix --unsafe-fixes || true
-
-      - name: Run Ruff formatter
-        run: ruff format . || true
+        run: |
+          PY_FILES=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" | head -1)
+          if [ -n "$PY_FILES" ]; then
+            ruff check . --fix --unsafe-fixes || true
+            ruff format . || true
+            echo "Ruff fixes applied"
+          else
+            echo "No Python files — skipping Ruff"
+          fi
 
       - name: Run Prettier
-        run: npx prettier --write "**/*.{js,jsx,ts,tsx,json,css,md}" || true
+        if: hashFiles('package.json') != ''
+        run: |
+          npx prettier --write "**/*.{js,jsx,ts,tsx,json,css,md}" \
+            --ignore-path .gitignore 2>/dev/null || true
 
       - name: Commit and push changes
         run: |
@@ -52,8 +61,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            echo "✅ No formatting changes needed"
           else
-            git commit -m "🔧 auto-fix: apply Ruff + Prettier formatting"
+            git commit -m "style: auto-fix formatting (Ruff + Prettier)"
             git push
+            echo "✅ Fixes committed and pushed"
           fi

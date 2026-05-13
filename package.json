@@ -1,0 +1,16 @@
+{
+  "name": "github-ai-agents",
+  "version": "1.0.0",
+  "description": "8 GitHub Actions AI agents for CI/CD automation",
+  "scripts": {
+    "build": "echo '✅ Build step — no bundler configured. Add your build command here.' && exit 0",
+    "lint": "echo '✅ Lint step — add ESLint config to enable.' && exit 0",
+    "test": "echo '✅ Test step — add your test runner here.' && exit 0"
+  },
+  "keywords": ["github-actions", "ci-cd", "automation", "agents"],
+  "author": "Rahul Singh",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

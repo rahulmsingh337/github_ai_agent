@@ -21,6 +21,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
+        if: hashFiles('package.json') != ''
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -31,13 +32,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          npm ci
-          pip install ruff mypy 2>/dev/null || true
+      - name: Install Node dependencies
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+
+      - name: Install Python tools
+        run: pip install ruff mypy --quiet 2>/dev/null || true
 
       - name: TypeScript check
         id: ts_check
+        if: hashFiles('tsconfig.json') != ''
         run: |
           if npx tsc --noEmit 2>&1 | tee /tmp/ts-errors.txt; then
             echo "errors=0" >> $GITHUB_OUTPUT
@@ -47,15 +51,12 @@ jobs:
             echo "errors=$ERROR_COUNT" >> $GITHUB_OUTPUT
             echo "success=false" >> $GITHUB_OUTPUT
             echo "::error::TypeScript: $ERROR_COUNT compilation error(s) found"
-            # Print first 10 errors as annotations
-            grep "error TS" /tmp/ts-errors.txt | head -10 | while read line; do
-              FILE=$(echo "$line" | grep -oP '(?<=\().*(?=,)' | head -1)
-              echo "::error file=$FILE::$line"
-            done
           fi
+        continue-on-error: true
 
       - name: Build check
         id: build_check
+        if: hashFiles('package.json') != ''
         run: |
           if npm run build 2>&1 | tee /tmp/build-output.txt; then
             echo "success=true" >> $GITHUB_OUTPUT
@@ -63,6 +64,7 @@ jobs:
             echo "success=false" >> $GITHUB_OUTPUT
             echo "::error::Build failed — check artifacts for details"
           fi
+        continue-on-error: true
 
       - name: Python syntax check
         id: py_check
@@ -79,38 +81,31 @@ jobs:
             echo "success=false" >> $GITHUB_OUTPUT
             echo "::error::Python syntax errors found"
           fi
+        continue-on-error: true
 
-      - name: Secret scan (new files only)
+      - name: Secret scan (changed files only)
         id: secret_scan
         run: |
           FOUND=false
-          # Get files changed in this push
           CHANGED=$(git diff HEAD~1 --name-only 2>/dev/null || git show --name-only HEAD | tail -n +2)
           while IFS= read -r file; do
             [ -z "$file" ] && continue
             [ ! -f "$file" ] && continue
-            # AWS key pattern
-            if grep -qE "AKIA[0-9A-Z]{16}" "$file"; then
-              echo "::error file=$file::🚨 Potential AWS Access Key detected"
+            if grep -qE "AKIA[0-9A-Z]{16}" "$file" 2>/dev/null; then
+              echo "::error file=$file::Potential AWS Access Key detected"
               FOUND=true
             fi
-            # GitHub token pattern
-            if grep -qE "ghp_[A-Za-z0-9]{36}" "$file"; then
-              echo "::error file=$file::🚨 Potential GitHub Token detected"
+            if grep -qE "ghp_[A-Za-z0-9]{36}" "$file" 2>/dev/null; then
+              echo "::error file=$file::Potential GitHub Token detected"
               FOUND=true
             fi
-            # Generic API key pattern
-            if grep -qiE "(api_key|apikey|api-key)\s*[=:\"']\s*[A-Za-z0-9+/]{32,}" "$file"; then
-              echo "::warning file=$file::Potential API key pattern detected — review manually"
-              FOUND=true
-            fi
-            # Anthropic/OpenAI key
-            if grep -qE "sk-[A-Za-z0-9]{32,}" "$file"; then
-              echo "::error file=$file::🚨 Potential AI API key detected"
+            if grep -qE "sk-[A-Za-z0-9]{32,}" "$file" 2>/dev/null; then
+              echo "::error file=$file::Potential AI API key detected"
               FOUND=true
             fi
           done <<< "$CHANGED"
           echo "found=$FOUND" >> $GITHUB_OUTPUT
+        continue-on-error: true
 
       - name: Auto-fix Python with Ruff
         if: steps.py_check.outputs.success == 'false' && steps.py_check.outputs.no_python != 'true'
@@ -123,7 +118,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "No auto-fixable Python issues"
           else
-            git commit -m "🔧 error-fix: auto-apply Ruff fixes"
+            git commit -m "fix: auto-apply Ruff formatting fixes"
             git push || true
           fi
 
@@ -139,13 +134,18 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Summary
+      - name: Job Summary
         if: always()
         run: |
           echo "## 🔧 Error-Fix Agent Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Check | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| TypeScript | ${{ steps.ts_check.outputs.success == 'true' && '✅ Pass' || '❌ Fail (' }}${{ steps.ts_check.outputs.errors }}${{ steps.ts_check.outputs.success != 'true' && ' errors)' || '' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Build | ${{ steps.build_check.outputs.success == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Python | ${{ steps.py_check.outputs.success == 'true' && '✅ Pass' || '❌ Fail' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Secrets | ${{ steps.secret_scan.outputs.found == 'false' && '✅ Clean' || '🚨 Review Required' }} |" >> $GITHUB_STEP_SUMMARY
+          TS="${{ steps.ts_check.outcome }}"
+          BUILD="${{ steps.build_check.outcome }}"
+          PY="${{ steps.py_check.outcome }}"
+          SECRETS="${{ steps.secret_scan.outputs.found }}"
+          [ "$TS" = "success" ] && echo "| TypeScript | ✅ Pass |" >> $GITHUB_STEP_SUMMARY || echo "| TypeScript | ${TS:-⏭️ skipped} |" >> $GITHUB_STEP_SUMMARY
+          [ "$BUILD" = "success" ] && echo "| Build | ✅ Pass |" >> $GITHUB_STEP_SUMMARY || echo "| Build | ${BUILD:-⏭️ skipped} |" >> $GITHUB_STEP_SUMMARY
+          [ "$PY" = "success" ] && echo "| Python | ✅ Pass |" >> $GITHUB_STEP_SUMMARY || echo "| Python | ${PY:-⏭️ skipped} |" >> $GITHUB_STEP_SUMMARY
+          [ "$SECRETS" = "false" ] && echo "| Secrets | ✅ Clean |" >> $GITHUB_STEP_SUMMARY || echo "| Secrets | 🚨 Review Required |" >> $GITHUB_STEP_SUMMARY

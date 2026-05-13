@@ -1,0 +1,4 @@
+# Add your Python dependencies here
+# Example:
+# requests==2.31.0
+# fastapi==0.110.0
