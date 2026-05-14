@@ -2,7 +2,17 @@ name: 🚀 Deployment Check Agent
 
 on:
   push:
-    branches: [main]
+    branches: [main, master, production, prod, release]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL to check (overrides secret)"
+        required: false
+        default: ""
+      wait_seconds:
+        description: "Seconds to wait before checking (default: 90)"
+        required: false
+        default: "90"
 
 permissions:
   contents: read
@@ -12,56 +22,102 @@ jobs:
   check-deployment:
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for deployment to complete
-        run: sleep 90
+      - name: Determine target URLs
+        id: urls
+        run: |
+          # Manual input overrides secret
+          MANUAL_URL="${{ github.event.inputs.url }}"
+          PROD_URL="${MANUAL_URL:-${{ secrets.VERCEL_PROJECT_URL }}}"
+          PROD_URL="${PROD_URL:-${{ secrets.DEPLOY_URL }}}"
+          PROD_URL="${PROD_URL:-${{ secrets.APP_URL }}}"
+          PROD_URL="${PROD_URL:-${{ secrets.PRODUCTION_URL }}}"
+
+          STAGING_URL="${{ secrets.STAGING_URL }}"
+          STAGING_URL="${STAGING_URL:-${{ secrets.STAGING_DEPLOY_URL }}}"
+
+          echo "prod_url=$PROD_URL"       >> $GITHUB_OUTPUT
+          echo "staging_url=$STAGING_URL" >> $GITHUB_OUTPUT
+          echo "has_prod=$( [ -n "$PROD_URL" ] && echo true || echo false )"       >> $GITHUB_OUTPUT
+          echo "has_staging=$( [ -n "$STAGING_URL" ] && echo true || echo false )" >> $GITHUB_OUTPUT
+
+          WAIT="${{ github.event.inputs.wait_seconds }}"
+          echo "wait=${WAIT:-90}" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment
+        run: |
+          WAIT=${{ steps.urls.outputs.wait }}
+          echo "⏳ Waiting ${WAIT}s for deployment to complete..."
+          sleep "$WAIT"
 
       - name: Check production URL
         id: prod_check
+        if: steps.urls.outputs.has_prod == 'true'
         run: |
-          URL="${{ secrets.VERCEL_PROJECT_URL }}"
-          if [ -z "$URL" ]; then
-            echo "healthy=skip" >> $GITHUB_OUTPUT
-            echo "status=no URL configured" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
-          if [ "$STATUS" = "200" ]; then
-            echo "healthy=true" >> $GITHUB_OUTPUT
+          URL="${{ steps.urls.outputs.prod_url }}"
+          echo "Checking: $URL"
+
+          RESULT=$(curl -s -o /tmp/prod_body.html \
+            -w "%{http_code}|%{time_total}|%{ssl_verify_result}|%{redirect_url}" \
+            --max-time 30 --location "$URL" 2>/dev/null || echo "000|0|1|")
+
+          HTTP=$(echo "$RESULT"  | cut -d"|" -f1)
+          TIME=$(echo "$RESULT"  | cut -d"|" -f2)
+          SSL=$(echo "$RESULT"   | cut -d"|" -f3)
+          BODY_SIZE=$(wc -c < /tmp/prod_body.html 2>/dev/null || echo 0)
+
+          echo "http=$HTTP"           >> $GITHUB_OUTPUT
+          echo "time=$TIME"           >> $GITHUB_OUTPUT
+          echo "ssl=$SSL"             >> $GITHUB_OUTPUT
+          echo "body_size=$BODY_SIZE" >> $GITHUB_OUTPUT
+
+          if [ "$HTTP" = "200" ] && [ "$BODY_SIZE" -gt 100 ]; then
+            echo "healthy=true"  >> $GITHUB_OUTPUT
+            echo "✅ Production healthy (HTTP $HTTP, ${TIME}s, ${BODY_SIZE}B)"
           else
             echo "healthy=false" >> $GITHUB_OUTPUT
+            echo "❌ Production unhealthy (HTTP $HTTP, ${TIME}s, ${BODY_SIZE}B)"
           fi
+        continue-on-error: true
 
       - name: Check staging URL
         id: staging_check
-        env:
-          STAGING_URL: ${{ secrets.STAGING_URL }}
+        if: steps.urls.outputs.has_staging == 'true'
         run: |
-          if [ -z "$STAGING_URL" ]; then
-            echo "status=skip" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$STAGING_URL" || echo "000")
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          URL="${{ steps.urls.outputs.staging_url }}"
+          echo "Checking staging: $URL"
+          RESULT=$(curl -s -o /dev/null \
+            -w "%{http_code}|%{time_total}" \
+            --max-time 30 --location "$URL" 2>/dev/null || echo "000|0")
+          HTTP=$(echo "$RESULT" | cut -d"|" -f1)
+          TIME=$(echo "$RESULT" | cut -d"|" -f2)
+          echo "http=$HTTP" >> $GITHUB_OUTPUT
+          echo "time=$TIME" >> $GITHUB_OUTPUT
+          [ "$HTTP" = "200" ] && echo "healthy=true" >> $GITHUB_OUTPUT || echo "healthy=false" >> $GITHUB_OUTPUT
+          echo "Staging: HTTP $HTTP (${TIME}s)"
+        continue-on-error: true
 
       - name: Post commit status
         uses: actions/github-script@v7
         with:
           script: |
-            const healthy = "${{ steps.prod_check.outputs.healthy }}";
-            const httpStatus = "${{ steps.prod_check.outputs.status }}";
-            const stagingStatus = "${{ steps.staging_check.outputs.status }}";
+            const hasProd      = "${{ steps.urls.outputs.has_prod }}"     === "true";
+            const hasStaging   = "${{ steps.urls.outputs.has_staging }}"  === "true";
+            const prodHealthy  = "${{ steps.prod_check.outputs.healthy }}" === "true";
+            const prodHttp     = "${{ steps.prod_check.outputs.http }}";
+            const prodTime     = "${{ steps.prod_check.outputs.time }}";
+            const stagingHttp  = "${{ steps.staging_check.outputs.http }}";
 
             let state, description;
-            if (healthy === "skip") {
+            if (!hasProd) {
               state = "success";
-              description = "No deployment URL configured — skipped";
-            } else if (healthy === "true") {
+              description = "No deployment URL configured — add VERCEL_PROJECT_URL or DEPLOY_URL secret";
+            } else if (prodHealthy) {
+              const staging = hasStaging ? ` | Staging: ${stagingHttp}` : "";
               state = "success";
-              description = `Production healthy (HTTP ${httpStatus})${stagingStatus !== "skip" ? ` | Staging: ${stagingStatus}` : ""}`;
+              description = `✅ Production healthy (HTTP ${prodHttp}, ${parseFloat(prodTime).toFixed(2)}s)${staging}`;
             } else {
               state = "failure";
-              description = `Deployment check failed (HTTP ${httpStatus})`;
+              description = `❌ Production unhealthy (HTTP ${prodHttp})`;
             }
 
             await github.rest.repos.createCommitStatus({
@@ -69,7 +125,8 @@ jobs:
               repo: context.repo.repo,
               sha: context.sha,
               state,
-              description,
+              description: description.slice(0, 140),
               context: "Deployment Health Check",
-              target_url: "${{ secrets.VERCEL_PROJECT_URL }}"
+              target_url: "${{ steps.urls.outputs.prod_url }}"
             });
+            console.log(`Status posted: ${state} — ${description}`);

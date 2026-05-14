@@ -18,175 +18,294 @@ jobs:
       contains(toLower(github.event.issue.title), 'bug') ||
       contains(toLower(github.event.issue.title), 'fix') ||
       contains(toLower(github.event.issue.title), 'crash') ||
-      contains(toLower(github.event.issue.title), 'broken')
+      contains(toLower(github.event.issue.title), 'broken') ||
+      contains(toLower(github.event.issue.title), 'fail') ||
+      contains(toLower(github.event.issue.title), 'exception')
 
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+      # ── Detect language stack ──────────────────────────────
+      - name: Detect languages
+        id: detect
+        run: |
+          has_node=false; has_python=false; has_go=false; has_rust=false; has_java=false
+          [ -f package.json ]  && has_node=true
+          find . -name "*.py"  ! -path "*/.git/*" ! -path "*/node_modules/*" | grep -q . && has_python=true
+          [ -f go.mod ]        && has_go=true
+          [ -f Cargo.toml ]    && has_rust=true
+          [ -f pom.xml ] || [ -f build.gradle ] && has_java=true
 
-      - name: Post "investigating" comment
+          stack=""
+          [ "$has_node"   = "true" ] && stack="$stack Node.js"
+          [ "$has_python" = "true" ] && stack="$stack Python"
+          [ "$has_go"     = "true" ] && stack="$stack Go"
+          [ "$has_rust"   = "true" ] && stack="$stack Rust"
+          [ "$has_java"   = "true" ] && stack="$stack Java"
+          echo "stack=${stack:-Unknown}" >> $GITHUB_OUTPUT
+
+      - name: Post investigating comment
         uses: actions/github-script@v7
         with:
           script: |
-            github.rest.issues.createComment({
+            const stack = "${{ steps.detect.outputs.stack }}".trim();
+            await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: "🛠️ **Auto-Resolve Agent activated.**\n\nAnalyzing the issue and scanning the codebase for root cause. I'll report back shortly..."
+              body: [
+                "## 🛠️ Auto-Resolve Agent Activated",
+                "",
+                `**Stack detected:** ${stack || "Unknown"}`,
+                "",
+                "Scanning codebase and analyzing the issue...",
+                "_I'll report back with a diagnosis shortly._"
+              ].join("\n")
             });
 
       - name: Gather codebase context
         id: context
         run: |
-          FILES=$(find . \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" \) \
-            ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" | head -25 | tr '\n' ' ')
-          echo "files=$FILES" >> $GITHUB_OUTPUT
+          # Collect relevant source files based on detected stack
+          SRC_FILES=""
 
-          RECENT=$(git log --oneline -5)
+          # Node/TypeScript
+          if [ -f package.json ]; then
+            TS=$(find . -name "*.ts" -o -name "*.tsx" | grep -v node_modules | grep -v ".git" | grep -v dist | head -15)
+            JS=$(find . -name "*.js" | grep -v node_modules | grep -v ".git" | grep -v dist | head -5)
+            SRC_FILES="$SRC_FILES $TS $JS"
+          fi
+
+          # Python
+          PY=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/__pycache__/*" | head -15)
+          [ -n "$PY" ] && SRC_FILES="$SRC_FILES $PY"
+
+          # Go
+          [ -f go.mod ] && SRC_FILES="$SRC_FILES $(find . -name "*.go" ! -path "*/.git/*" ! -path "*/vendor/*" | head -10)"
+
+          # Rust
+          [ -f Cargo.toml ] && SRC_FILES="$SRC_FILES $(find . -name "*.rs" ! -path "*/.git/*" ! -path "*/target/*" | head -10)"
+
+          # Java
+          [ -f pom.xml ] || [ -f build.gradle ] && \
+            SRC_FILES="$SRC_FILES $(find . -name "*.java" ! -path "*/.git/*" | head -10)"
+
+          TRIMMED=$(echo $SRC_FILES | tr ' ' '\n' | grep -v '^$' | sort -u | head -30 | tr '\n' ' ')
+          echo "files=$TRIMMED" >> $GITHUB_OUTPUT
+
+          # Recent commits and error logs
+          RECENT=$(git log --oneline -8 2>/dev/null || echo "No git history")
           echo "recent_commits<<EOF" >> $GITHUB_OUTPUT
-          echo "$RECENT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "$RECENT"             >> $GITHUB_OUTPUT
+          echo "EOF"                 >> $GITHUB_OUTPUT
+
+          # Package info
+          PKG=""
+          [ -f package.json ]    && PKG="$PKG\npackage.json: $(cat package.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name','?'), 'v'+d.get('version','?'))" 2>/dev/null)"
+          [ -f go.mod ]          && PKG="$PKG\ngo.mod: $(head -3 go.mod)"
+          [ -f Cargo.toml ]      && PKG="$PKG\nCargo.toml: $(grep '^name\|^version' Cargo.toml | head -2 | tr '\n' ' ')"
+          [ -f pyproject.toml ]  && PKG="$PKG\npyproject.toml: $(grep '^name\|^version' pyproject.toml | head -2 | tr '\n' ' ')"
+          echo "pkg_info=$PKG" >> $GITHUB_OUTPUT
 
       - name: Diagnose with Claude API
         id: diagnose
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo '{"diagnosis":"No ANTHROPIC_API_KEY configured — manual review required","fixable":false,"fix_description":""}' > /tmp/diagnosis.json
+            echo '{"diagnosis":"ANTHROPIC_API_KEY not configured. Add it to repo secrets to enable AI diagnosis.","fixable":false,"confidence":"none","fix_description":"","affected_file":"","fix_summary":"Manual review required"}' > /tmp/diagnosis.json
             exit 0
           fi
 
-          PROMPT="You are a senior engineer. Analyze this GitHub issue and determine if it can be auto-fixed.
+          STACK="${{ steps.detect.outputs.stack }}"
+          FILES="${{ steps.context.outputs.files }}"
+          PKG="${{ steps.context.outputs.pkg_info }}"
+          COMMITS="${{ steps.context.outputs.recent_commits }}"
 
-          Issue Title: $ISSUE_TITLE
-          Issue Body: $ISSUE_BODY
-          Source Files: ${{ steps.context.outputs.files }}
-          Recent Commits: ${{ steps.context.outputs.recent_commits }}
+          # Read file contents for context (first 3 most relevant files)
+          FILE_CONTENTS=""
+          for f in $FILES; do
+            if [ -f "$f" ] && [ $(wc -l < "$f") -lt 200 ]; then
+              FILE_CONTENTS="$FILE_CONTENTS\n\n--- $f ---\n$(cat "$f")"
+            fi
+          done
+          FILE_CONTENTS=$(echo "$FILE_CONTENTS" | head -c 3000)
 
-          Respond ONLY with a valid JSON object (no markdown, no backticks):
-          {
-            \"diagnosis\": \"clear explanation of root cause\",
-            \"fixable\": true or false,
-            \"confidence\": \"high|medium|low\",
-            \"fix_description\": \"what the fix does\",
-            \"affected_file\": \"relative/path/to/file or empty string\",
-            \"fix_summary\": \"one-line summary for PR title\"
-          }"
+          PROMPT="You are a senior software engineer. Analyze this GitHub issue and determine if it can be auto-fixed.
 
-          curl -s https://api.anthropic.com/v1/messages \
+Stack: $STACK
+Project: $PKG
+Issue Title: ${{ github.event.issue.title }}
+Issue Body: ${{ github.event.issue.body }}
+
+Recent commits:
+$COMMITS
+
+Source files in repo:
+$FILES
+
+File contents (sample):
+$FILE_CONTENTS
+
+Respond ONLY with a valid JSON object (no markdown, no backticks, no explanation):
+{
+  \"diagnosis\": \"Clear technical explanation of the root cause\",
+  \"fixable\": true or false,
+  \"confidence\": \"high\" or \"medium\" or \"low\",
+  \"fix_description\": \"What the fix does (empty string if not fixable)\",
+  \"affected_file\": \"relative/path/to/file (empty string if not fixable)\",
+  \"fix_code\": \"The actual code change needed (empty string if not fixable)\",
+  \"fix_summary\": \"One line summary for PR title\"
+}"
+
+          curl -s "https://api.anthropic.com/v1/messages" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "{
-              \"model\": \"claude-opus-4-20250514\",
-              \"max_tokens\": 1024,
-              \"messages\": [{\"role\": \"user\", \"content\": $(echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}]
-            }" > /tmp/api_response.json
+            -d "$(python3 -c "
+import json, sys, os
+prompt = os.environ.get('PROMPT', '')
+payload = {
+    'model': 'claude-sonnet-4-20250514',
+    'max_tokens': 1024,
+    'messages': [{'role': 'user', 'content': '''$PROMPT'''}]
+}
+print(json.dumps(payload))
+")" > /tmp/api_response.json 2>/dev/null
 
-          # Extract text content from response
-          python3 -c "
-          import json, sys
-          with open('/tmp/api_response.json') as f:
-            data = json.load(f)
-          text = data['content'][0]['text']
-          # Validate it's JSON
-          parsed = json.loads(text)
-          with open('/tmp/diagnosis.json', 'w') as f:
-            json.dump(parsed, f)
-          " || echo '{"diagnosis":"Failed to parse AI response","fixable":false,"fix_description":""}' > /tmp/diagnosis.json
+          python3 << 'PYEOF'
+import json, sys
+try:
+    with open('/tmp/api_response.json') as f:
+        data = json.load(f)
+    text = data['content'][0]['text']
+    # Clean any markdown wrapping
+    text = text.strip().strip('`')
+    if text.startswith('json'):
+        text = text[4:].strip()
+    parsed = json.loads(text)
+    with open('/tmp/diagnosis.json', 'w') as f:
+        json.dump(parsed, f)
+    print("✅ Diagnosis complete:", parsed.get('diagnosis','')[:80])
+except Exception as e:
+    print(f"Parse error: {e}")
+    with open('/tmp/diagnosis.json', 'w') as f:
+        json.dump({"diagnosis": "Failed to parse AI response", "fixable": False,
+                   "confidence": "none", "fix_description": "", "affected_file": "",
+                   "fix_code": "", "fix_summary": "Manual review required"}, f)
+PYEOF
 
-          cat /tmp/diagnosis.json
-
-      - name: Post diagnosis and create PR if fixable
+      - name: Apply fix and create PR
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            let diagnosis;
+            let dx;
             try {
-              diagnosis = JSON.parse(fs.readFileSync('/tmp/diagnosis.json', 'utf8'));
-            } catch (e) {
-              diagnosis = { diagnosis: "Could not parse diagnosis", fixable: false };
+              dx = JSON.parse(fs.readFileSync('/tmp/diagnosis.json', 'utf8'));
+            } catch(e) {
+              dx = { diagnosis: "Could not read diagnosis", fixable: false, confidence: "none" };
             }
 
-            if (!diagnosis.fixable) {
+            const confEmoji = { high: "🟢", medium: "🟡", low: "🔴", none: "⚪" };
+
+            if (!dx.fixable) {
               await github.rest.issues.createComment({
                 issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: `## 🔍 Auto-Resolve Diagnosis
-
-                **Root Cause:** ${diagnosis.diagnosis}
-
-                **Confidence:** ${diagnosis.confidence || 'N/A'}
-
-                ⚠️ This issue requires **manual intervention** — the fix cannot be safely automated.
-
-                > Auto-generated by Auto-Resolve Agent`
+                owner: context.repo.owner, repo: context.repo.repo,
+                body: [
+                  "## 🔍 Auto-Resolve Diagnosis",
+                  "",
+                  `**Root Cause:** ${dx.diagnosis}`,
+                  "",
+                  `**Confidence:** ${confEmoji[dx.confidence] || "⚪"} ${dx.confidence}`,
+                  "",
+                  "⚠️ This issue requires **manual intervention** — it cannot be safely auto-fixed.",
+                  "",
+                  dx.fix_description ? `**Suggested approach:** ${dx.fix_description}` : "",
+                  "",
+                  "_Auto-generated by Auto-Resolve Agent_"
+                ].filter(v => v !== undefined).join("\n")
               });
               return;
             }
 
             // Create fix branch
             const branchName = `auto-fix/issue-${context.issue.number}`;
-            const { data: mainRef } = await github.rest.git.getRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: "heads/main"
-            });
-
             try {
-              await github.rest.git.createRef({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: `refs/heads/${branchName}`,
-                sha: mainRef.object.sha
+              const { data: ref } = await github.rest.git.getRef({
+                owner: context.repo.owner, repo: context.repo.repo,
+                ref: "heads/main"
               });
-            } catch (e) {
-              // Branch may already exist
+              await github.rest.git.createRef({
+                owner: context.repo.owner, repo: context.repo.repo,
+                ref: `refs/heads/${branchName}`, sha: ref.object.sha
+              });
+            } catch(e) {
+              console.log("Branch may already exist:", e.message);
+            }
+
+            // If we have specific file + code to write, commit it
+            if (dx.affected_file && dx.fix_code) {
+              try {
+                let sha;
+                try {
+                  const { data: f } = await github.rest.repos.getContent({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    path: dx.affected_file, ref: branchName
+                  });
+                  sha = f.sha;
+                } catch(e) { /* new file */ }
+
+                const content = Buffer.from(dx.fix_code).toString('base64');
+                await github.rest.repos.createOrUpdateFileContents({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  path: dx.affected_file,
+                  message: `fix: ${dx.fix_summary || 'auto-fix issue #' + context.issue.number}`,
+                  content, branch: branchName, sha
+                });
+              } catch(e) {
+                console.log("Could not commit fix:", e.message);
+              }
             }
 
             // Create PR
             const pr = await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `🛠️ Auto-fix: ${diagnosis.fix_summary || context.payload.issue.title}`,
-              body: `Closes #${context.issue.number}
-
-              ## 🔍 Diagnosis
-              ${diagnosis.diagnosis}
-
-              ## 🔧 Fix Applied
-              ${diagnosis.fix_description}
-
-              **Confidence:** ${diagnosis.confidence || 'N/A'}
-              **Affected File:** \`${diagnosis.affected_file || 'See diff'}\`
-
-              > Auto-generated by Auto-Resolve Agent`,
-              head: branchName,
-              base: "main"
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `🛠️ Auto-fix: ${dx.fix_summary || context.payload.issue.title}`,
+              body: [
+                `Closes #${context.issue.number}`,
+                "",
+                "## 🔍 Diagnosis",
+                dx.diagnosis,
+                "",
+                "## 🔧 Fix Applied",
+                dx.fix_description,
+                dx.affected_file ? `\n**Affected file:** \`${dx.affected_file}\`` : "",
+                "",
+                `**Confidence:** ${confEmoji[dx.confidence] || "⚪"} ${dx.confidence}`,
+                "",
+                "_Auto-generated by Auto-Resolve Agent_"
+              ].filter(v => v !== undefined).join("\n"),
+              head: branchName, base: "main"
             });
 
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## ✅ Auto-Resolve Complete
-
-              **Diagnosis:** ${diagnosis.diagnosis}
-
-              **Fix:** ${diagnosis.fix_description}
-
-              **PR Created:** #${pr.data.number} — ${pr.data.html_url}
-
-              > Auto-generated by Auto-Resolve Agent`
+              owner: context.repo.owner, repo: context.repo.repo,
+              body: [
+                "## ✅ Auto-Resolve Complete",
+                "",
+                `**Diagnosis:** ${dx.diagnosis}`,
+                "",
+                `**Fix:** ${dx.fix_description}`,
+                "",
+                `**Confidence:** ${confEmoji[dx.confidence] || "⚪"} ${dx.confidence}`,
+                "",
+                `**PR Created:** #${pr.data.number} — ${pr.data.html_url}`,
+                "",
+                "_Auto-generated by Auto-Resolve Agent_"
+              ].join("\n")
             });

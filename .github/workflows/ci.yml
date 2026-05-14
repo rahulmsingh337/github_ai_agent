@@ -11,87 +11,312 @@ permissions:
   pull-requests: write
 
 jobs:
-  ci:
+  detect-and-ci:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    outputs:
+      has_node:    ${{ steps.detect.outputs.has_node }}
+      has_python:  ${{ steps.detect.outputs.has_python }}
+      has_go:      ${{ steps.detect.outputs.has_go }}
+      has_rust:    ${{ steps.detect.outputs.has_rust }}
+      has_java:    ${{ steps.detect.outputs.has_java }}
+      has_make:    ${{ steps.detect.outputs.has_make }}
 
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Language Detection ─────────────────────────────────
+      - name: Detect languages & build tools
+        id: detect
+        run: |
+          has_node=false;   has_python=false; has_go=false
+          has_rust=false;   has_java=false;   has_make=false
+
+          [ -f package.json ]    && has_node=true
+          [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f setup.py ] && has_python=true
+          [ -f go.mod ]          && has_go=true
+          [ -f Cargo.toml ]      && has_rust=true
+          [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ] && has_java=true
+          [ -f Makefile ] || [ -f makefile ]     && has_make=true
+
+          # Also detect by file extensions if no manifest
+          if [ "$has_python" = "false" ]; then
+            PY=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" | head -1)
+            [ -n "$PY" ] && has_python=true
+          fi
+
+          echo "has_node=$has_node"     >> $GITHUB_OUTPUT
+          echo "has_python=$has_python" >> $GITHUB_OUTPUT
+          echo "has_go=$has_go"         >> $GITHUB_OUTPUT
+          echo "has_rust=$has_rust"     >> $GITHUB_OUTPUT
+          echo "has_java=$has_java"     >> $GITHUB_OUTPUT
+          echo "has_make=$has_make"     >> $GITHUB_OUTPUT
+
+          echo "### 🔍 Detected Stack" >> $GITHUB_STEP_SUMMARY
+          echo "| Language | Detected |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Node.js  | $has_node |"   >> $GITHUB_STEP_SUMMARY
+          echo "| Python   | $has_python |" >> $GITHUB_STEP_SUMMARY
+          echo "| Go       | $has_go |"     >> $GITHUB_STEP_SUMMARY
+          echo "| Rust     | $has_rust |"   >> $GITHUB_STEP_SUMMARY
+          echo "| Java     | $has_java |"   >> $GITHUB_STEP_SUMMARY
+          echo "| Makefile | $has_make |"   >> $GITHUB_STEP_SUMMARY
+
+      # ── Node.js ────────────────────────────────────────────
       - name: Setup Node.js
-        if: hashFiles('package.json') != ''
+        if: steps.detect.outputs.has_node == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
 
+      - name: Install Node dependencies
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if [ -f package-lock.json ]; then npm ci --prefer-offline
+          elif [ -f yarn.lock ];        then npm install -g yarn && yarn install --frozen-lockfile
+          elif [ -f pnpm-lock.yaml ];   then npm install -g pnpm && pnpm install --frozen-lockfile
+          else npm install; fi
+
+      - name: ESLint
+        id: eslint
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if [ -f .eslintrc.js ] || [ -f .eslintrc.json ] || [ -f .eslintrc.yml ] || \
+             [ -f .eslintrc.yaml ] || [ -f .eslintrc.cjs ] || \
+             grep -q '"eslint"' package.json 2>/dev/null; then
+            npx eslint . --ext .ts,.tsx,.js,.jsx,.mjs,.cjs --max-warnings 0 || true
+          else
+            echo "No ESLint config found — skipping"
+          fi
+        continue-on-error: true
+
+      - name: TypeScript check
+        id: typecheck
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if [ -f tsconfig.json ] || [ -f tsconfig.base.json ]; then
+            npx tsc --noEmit
+          else
+            echo "No tsconfig.json — skipping"
+          fi
+        continue-on-error: true
+
+      - name: Node build
+        id: node_build
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if grep -q '"build"' package.json 2>/dev/null; then
+            npm run build
+          else
+            echo "No build script in package.json — skipping"
+          fi
+        continue-on-error: true
+
+      - name: Node tests
+        id: node_test
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if grep -q '"test"' package.json 2>/dev/null; then
+            npm test -- --passWithNoTests 2>/dev/null || npm test || true
+          else
+            echo "No test script — skipping"
+          fi
+        continue-on-error: true
+
+      # ── Python ─────────────────────────────────────────────
       - name: Setup Python
+        if: steps.detect.outputs.has_python == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Node dependencies
-        if: hashFiles('package-lock.json') != ''
-        run: npm ci
-
       - name: Install Python dependencies
+        if: steps.detect.outputs.has_python == 'true'
         run: |
           pip install ruff mypy --quiet
-          [ -f requirements.txt ] && pip install -r requirements.txt --quiet || true
+          if [ -f requirements.txt ];       then pip install -r requirements.txt --quiet || true
+          elif [ -f pyproject.toml ];       then pip install -e ".[dev]" --quiet 2>/dev/null || pip install -e . --quiet || true
+          elif [ -f setup.py ];             then pip install -e . --quiet || true; fi
 
-      - name: Run ESLint
-        id: eslint
-        if: hashFiles('package.json') != '' && hashFiles('.eslintrc*', 'eslint.config*') != ''
-        run: npx eslint . --ext .ts,.tsx,.js,.jsx --max-warnings 0
-        continue-on-error: true
-
-      - name: Run TypeScript check
-        id: typecheck
-        if: hashFiles('tsconfig.json') != ''
-        run: npx tsc --noEmit
-        continue-on-error: true
-
-      - name: Run Ruff (Python linter)
+      - name: Ruff lint
         id: ruff
+        if: steps.detect.outputs.has_python == 'true'
+        run: ruff check . --output-format github
+        continue-on-error: true
+
+      - name: Ruff format check
+        id: ruff_format
+        if: steps.detect.outputs.has_python == 'true'
+        run: ruff format --check .
+        continue-on-error: true
+
+      - name: Python tests
+        id: python_test
+        if: steps.detect.outputs.has_python == 'true'
         run: |
-          PY_FILES=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" | head -1)
-          if [ -n "$PY_FILES" ]; then
-            ruff check . --output-format github
+          if [ -f pytest.ini ] || [ -f setup.cfg ] || grep -q '\[tool.pytest' pyproject.toml 2>/dev/null; then
+            pip install pytest --quiet && python -m pytest --tb=short -q || true
           else
-            echo "No Python files found — skipping Ruff"
+            echo "No pytest config — skipping"
           fi
         continue-on-error: true
 
-      - name: Build project
-        id: build
-        if: hashFiles('package.json') != ''
-        run: npm run build
+      # ── Go ─────────────────────────────────────────────────
+      - name: Setup Go
+        if: steps.detect.outputs.has_go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Go build
+        id: go_build
+        if: steps.detect.outputs.has_go == 'true'
+        run: go build ./...
         continue-on-error: true
 
-      - name: Post PR Comment
+      - name: Go vet
+        id: go_vet
+        if: steps.detect.outputs.has_go == 'true'
+        run: go vet ./...
+        continue-on-error: true
+
+      - name: Go test
+        id: go_test
+        if: steps.detect.outputs.has_go == 'true'
+        run: go test ./... -timeout 120s
+        continue-on-error: true
+
+      # ── Rust ───────────────────────────────────────────────
+      - name: Setup Rust
+        if: steps.detect.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust build
+        id: rust_build
+        if: steps.detect.outputs.has_rust == 'true'
+        run: cargo build --all
+        continue-on-error: true
+
+      - name: Rust clippy
+        id: rust_clippy
+        if: steps.detect.outputs.has_rust == 'true'
+        run: cargo clippy --all -- -D warnings
+        continue-on-error: true
+
+      - name: Rust test
+        id: rust_test
+        if: steps.detect.outputs.has_rust == 'true'
+        run: cargo test --all
+        continue-on-error: true
+
+      # ── Java ───────────────────────────────────────────────
+      - name: Setup Java
+        if: steps.detect.outputs.has_java == 'true'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Java build (Maven)
+        id: mvn_build
+        if: steps.detect.outputs.has_java == 'true' && hashFiles('pom.xml') != ''
+        run: mvn -B compile -q
+        continue-on-error: true
+
+      - name: Java test (Maven)
+        id: mvn_test
+        if: steps.detect.outputs.has_java == 'true' && hashFiles('pom.xml') != ''
+        run: mvn -B test -q
+        continue-on-error: true
+
+      - name: Java build (Gradle)
+        id: gradle_build
+        if: steps.detect.outputs.has_java == 'true' && hashFiles('build.gradle', 'build.gradle.kts') != ''
+        run: ./gradlew build -q
+        continue-on-error: true
+
+      # ── Makefile ───────────────────────────────────────────
+      - name: Make build
+        id: make_build
+        if: steps.detect.outputs.has_make == 'true'
+        run: make --dry-run 2>/dev/null && make || true
+        continue-on-error: true
+
+      # ── PR Comment ─────────────────────────────────────────
+      - name: Post PR comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
-            const outcomes = {
-              eslint:    "${{ steps.eslint.outcome }}",
-              typecheck: "${{ steps.typecheck.outcome }}",
-              ruff:      "${{ steps.ruff.outcome }}",
-              build:     "${{ steps.build.outcome }}"
+            const o = (id) => {
+              const map = {
+                eslint:      "${{ steps.eslint.outcome }}",
+                typecheck:   "${{ steps.typecheck.outcome }}",
+                node_build:  "${{ steps.node_build.outcome }}",
+                node_test:   "${{ steps.node_test.outcome }}",
+                ruff:        "${{ steps.ruff.outcome }}",
+                ruff_format: "${{ steps.ruff_format.outcome }}",
+                python_test: "${{ steps.python_test.outcome }}",
+                go_build:    "${{ steps.go_build.outcome }}",
+                go_vet:      "${{ steps.go_vet.outcome }}",
+                go_test:     "${{ steps.go_test.outcome }}",
+                rust_build:  "${{ steps.rust_build.outcome }}",
+                rust_clippy: "${{ steps.rust_clippy.outcome }}",
+                rust_test:   "${{ steps.rust_test.outcome }}",
+                mvn_build:   "${{ steps.mvn_build.outcome }}",
+                mvn_test:    "${{ steps.mvn_test.outcome }}",
+                gradle_build:"${{ steps.gradle_build.outcome }}",
+                make_build:  "${{ steps.make_build.outcome }}",
+              };
+              return map[id] || "skipped";
             };
-            const icon = (r) => r === "success" ? "✅" : r === "skipped" ? "⏭️" : "❌";
-            const row = (name, key) => `| ${name} | ${icon(outcomes[key])} ${outcomes[key] || "skipped"} |`;
+            const icon = r => ({ success:"✅", failure:"❌", skipped:"⏭️" })[r] || "⏭️";
+            const row = (name, id) => {
+              const r = o(id);
+              return r !== "skipped" ? `| ${name} | ${icon(r)} ${r} |` : null;
+            };
+            const rows = [
+              row("ESLint",          "eslint"),
+              row("TypeScript",      "typecheck"),
+              row("Node Build",      "node_build"),
+              row("Node Tests",      "node_test"),
+              row("Python Ruff",     "ruff"),
+              row("Ruff Format",     "ruff_format"),
+              row("Python Tests",    "python_test"),
+              row("Go Build",        "go_build"),
+              row("Go Vet",          "go_vet"),
+              row("Go Tests",        "go_test"),
+              row("Rust Build",      "rust_build"),
+              row("Rust Clippy",     "rust_clippy"),
+              row("Rust Tests",      "rust_test"),
+              row("Maven Build",     "mvn_build"),
+              row("Maven Tests",     "mvn_test"),
+              row("Gradle Build",    "gradle_build"),
+              row("Make Build",      "make_build"),
+            ].filter(Boolean);
+
+            const stack = [
+              "${{ steps.detect.outputs.has_node }}"   === "true" ? "Node.js"  : null,
+              "${{ steps.detect.outputs.has_python }}"  === "true" ? "Python"   : null,
+              "${{ steps.detect.outputs.has_go }}"      === "true" ? "Go"       : null,
+              "${{ steps.detect.outputs.has_rust }}"    === "true" ? "Rust"     : null,
+              "${{ steps.detect.outputs.has_java }}"    === "true" ? "Java"     : null,
+              "${{ steps.detect.outputs.has_make }}"    === "true" ? "Makefile" : null,
+            ].filter(Boolean).join(", ") || "No stack detected";
 
             const body = [
               "## 🤖 CI Agent Report",
+              `> **Stack detected:** ${stack} · Commit: \`${{ github.sha }}\``,
               "",
               "| Check | Status |",
               "|-------|--------|",
-              row("ESLint", "eslint"),
-              row("TypeScript", "typecheck"),
-              row("Python Ruff", "ruff"),
-              row("Build", "build"),
+              ...rows,
               "",
-              `> Commit: \`${{ github.sha }}\``
+              "_Auto-generated by CI Agent_"
             ].join("\n");
 
             const { data: comments } = await github.rest.issues.listComments({

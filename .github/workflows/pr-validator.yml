@@ -16,68 +16,157 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate PR Title (Conventional Commits)
+      # ── Detect stack ───────────────────────────────────────
+      - name: Detect languages
+        id: detect
+        run: |
+          has_node=false; has_python=false; has_go=false; has_rust=false; has_java=false
+          [ -f package.json ]    && has_node=true
+          find . -name "*.py"  ! -path "*/.git/*" ! -path "*/node_modules/*" | grep -q . && has_python=true
+          [ -f go.mod ]          && has_go=true
+          [ -f Cargo.toml ]      && has_rust=true
+          [ -f pom.xml ] || [ -f build.gradle ] && has_java=true
+          stack=""
+          [ "$has_node"   = "true" ] && stack="$stack Node.js"
+          [ "$has_python" = "true" ] && stack="$stack Python"
+          [ "$has_go"     = "true" ] && stack="$stack Go"
+          [ "$has_rust"   = "true" ] && stack="$stack Rust"
+          [ "$has_java"   = "true" ] && stack="$stack Java"
+          echo "stack=${stack:-Unknown}" >> $GITHUB_OUTPUT
+
+      # ── Title check ────────────────────────────────────────
+      - name: Validate PR Title
         id: title_check
         run: |
           TITLE="${{ github.event.pull_request.title }}"
           if echo "$TITLE" | grep -qE "^(feat|fix|docs|style|refactor|test|chore|perf|ci|build|revert)(\(.+\))?: .{1,100}$"; then
-            echo "valid=true" >> $GITHUB_OUTPUT
-            echo "message=Valid Conventional Commit format ✅" >> $GITHUB_OUTPUT
+            echo "valid=true"  >> $GITHUB_OUTPUT
+            echo "msg=Valid Conventional Commit ✅" >> $GITHUB_OUTPUT
           else
             echo "valid=false" >> $GITHUB_OUTPUT
-            echo "message=Must match: \`type(scope): description\` — e.g. \`feat(auth): add login\`" >> $GITHUB_OUTPUT
+            echo "msg=Must match \`type(scope): description\` — e.g. \`feat(auth): add login\`" >> $GITHUB_OUTPUT
           fi
 
-      - name: Scan diff for secrets
+      # ── PR size check ──────────────────────────────────────
+      - name: PR size check
+        id: size_check
+        run: |
+          git fetch origin ${{ github.base_ref }} --quiet 2>/dev/null || true
+          LINES=$(git diff --stat origin/${{ github.base_ref }}...HEAD 2>/dev/null | \
+            tail -1 | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)
+          DELS=$(git diff --stat origin/${{ github.base_ref }}...HEAD 2>/dev/null | \
+            tail -1 | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)
+          TOTAL=$((${LINES:-0} + ${DELS:-0}))
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null | wc -l || echo 0)
+
+          if   [ "$TOTAL" -lt 50 ];   then SIZE="XS 🟢"
+          elif [ "$TOTAL" -lt 200 ];  then SIZE="S 🟢"
+          elif [ "$TOTAL" -lt 500 ];  then SIZE="M 🟡"
+          elif [ "$TOTAL" -lt 1000 ]; then SIZE="L 🟠"
+          else                              SIZE="XL 🔴 (consider splitting)"
+          fi
+
+          echo "size=$SIZE"    >> $GITHUB_OUTPUT
+          echo "lines=$TOTAL"  >> $GITHUB_OUTPUT
+          echo "files=$FILES"  >> $GITHUB_OUTPUT
+
+          STATS=$(git diff --stat origin/${{ github.base_ref }}...HEAD 2>/dev/null | tail -1 || echo "N/A")
+          echo "stats=$STATS"  >> $GITHUB_OUTPUT
+
+      # ── Secret scan ────────────────────────────────────────
+      - name: Secret scan
         id: secret_scan
         run: |
           git fetch origin ${{ github.base_ref }} --quiet 2>/dev/null || true
           git diff origin/${{ github.base_ref }}...HEAD > /tmp/diff.txt 2>/dev/null || \
-          git diff HEAD~1 > /tmp/diff.txt 2>/dev/null || \
-          echo "" > /tmp/diff.txt
+            git diff HEAD~1 > /tmp/diff.txt 2>/dev/null || echo "" > /tmp/diff.txt
 
-          FOUND=false
-          if grep -qE "AKIA[0-9A-Z]{16}" /tmp/diff.txt 2>/dev/null; then FOUND=true; fi
-          if grep -qE "ghp_[A-Za-z0-9]{36}" /tmp/diff.txt 2>/dev/null; then FOUND=true; fi
-          if grep -qE "sk-[A-Za-z0-9]{32,}" /tmp/diff.txt 2>/dev/null; then FOUND=true; fi
-          if grep -qiE "(api_key|secret_key|password)\s*[=:\"']\s*[A-Za-z0-9+/]{20,}" /tmp/diff.txt 2>/dev/null; then FOUND=true; fi
-          echo "secrets_found=$FOUND" >> $GITHUB_OUTPUT
+          SECRETS_FOUND=""
+          check() {
+            local name=$1; local pattern=$2
+            if grep -qE "$pattern" /tmp/diff.txt 2>/dev/null; then
+              SECRETS_FOUND="$SECRETS_FOUND $name"
+            fi
+          }
+          check "AWS-Key"      "AKIA[0-9A-Z]{16}"
+          check "GitHub-Token" "ghp_[A-Za-z0-9]{36}"
+          check "OpenAI-Key"   "sk-[A-Za-z0-9]{48}"
+          check "Anthropic-Key" "sk-ant-[A-Za-z0-9]+"
+          check "Stripe-Key"   "sk_live_[A-Za-z0-9]+"
+          check "Twilio-SID"   "AC[a-z0-9]{32}"
+          check "GCP-Key"      "AIza[0-9A-Za-z-_]{35}"
+          check "Private-Key"  "BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY"
+          check "Generic-Secret" "(api_key|api_secret|secret_key|auth_token|access_token)['\"\s]*[:=]['\"\s]*[A-Za-z0-9+/]{20,}"
 
-      - name: Generate diff summary
-        id: diff_summary
+          if [ -n "$SECRETS_FOUND" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "types=${SECRETS_FOUND# }" >> $GITHUB_OUTPUT
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "types=" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Changed file list ──────────────────────────────────
+      - name: Get changed files
+        id: files
         run: |
           git fetch origin ${{ github.base_ref }} --quiet 2>/dev/null || true
-          STATS=$(git diff --stat origin/${{ github.base_ref }}...HEAD 2>/dev/null | tail -1 || echo "Unable to compute diff stats")
-          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null | head -15 | tr '\n' ' ' || echo "")
-          echo "stats=$STATS" >> $GITHUB_OUTPUT
-          echo "files=$FILES" >> $GITHUB_OUTPUT
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null | head -20 | tr '\n' '\n' || echo "")
+          echo "list<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES"    >> $GITHUB_OUTPUT
+          echo "EOF"       >> $GITHUB_OUTPUT
 
+      # ── Post comment ───────────────────────────────────────
       - name: Post validation comment
         uses: actions/github-script@v7
         with:
           script: |
-            const titleValid = "${{ steps.title_check.outputs.valid }}" === "true";
-            const secretsFound = "${{ steps.secret_scan.outputs.secrets_found }}" === "true";
-            const titleMsg = `${{ steps.title_check.outputs.message }}`;
-            const stats = `${{ steps.diff_summary.outputs.stats }}`;
-            const files = `${{ steps.diff_summary.outputs.files }}`;
+            const titleValid   = "${{ steps.title_check.outputs.valid }}"   === "true";
+            const secretsFound = "${{ steps.secret_scan.outputs.found }}"  === "true";
+            const secretTypes  = "${{ steps.secret_scan.outputs.types }}";
+            const titleMsg     = `${{ steps.title_check.outputs.msg }}`;
+            const size         = `${{ steps.size_check.outputs.size }}`;
+            const lines        = `${{ steps.size_check.outputs.lines }}`;
+            const files        = `${{ steps.size_check.outputs.files }}`;
+            const stats        = `${{ steps.size_check.outputs.stats }}`;
+            const stack        = `${{ steps.detect.outputs.stack }}`.trim();
+            const fileList     = `${{ steps.files.outputs.list }}`.trim()
+              .split("\n").filter(Boolean).map(f => `\`${f}\``).join(", ");
 
-            const lines = [
+            const icon = ok => ok ? "✅" : "❌";
+            const lines_body = [
               "## 🔍 PR Validator Report",
               "",
+              `> **Stack:** ${stack || "Unknown"} · **Commit:** \`${{ github.sha }}\``,
+              "",
+              "### Checks",
               "| Check | Status | Detail |",
               "|-------|--------|--------|",
-              `| PR Title Format | ${titleValid ? "✅ Pass" : "❌ Fail"} | ${titleMsg} |`,
-              `| Secret Scan | ${secretsFound ? "🚨 **BLOCKED**" : "✅ Clean"} | ${secretsFound ? "Potential secrets found — review diff!" : "No secrets detected"} |`,
+              `| PR Title Format | ${icon(titleValid)} | ${titleMsg} |`,
+              `| Secret Scan | ${secretsFound ? "🚨 BLOCKED" : "✅ Clean"} | ${secretsFound ? `Types found: **${secretTypes}**` : "No secrets detected"} |`,
+              `| PR Size | ${size} | ${lines} lines changed across ${files} files |`,
               "",
-              `**Diff:** ${stats}`,
+              "### Changed Files",
+              fileList || "_No files changed_",
+              "",
+              `**Diff summary:** ${stats}`,
             ];
-            if (files) lines.push(`**Files:** \`${files.trim()}\``);
+
             if (secretsFound) {
-              lines.push("", "---", "> 🚨 **ACTION REQUIRED:** Do not merge until secrets are removed from the diff.");
+              lines_body.push(
+                "",
+                "---",
+                "## 🚨 Action Required",
+                `Potential secrets detected: **${secretTypes}**`,
+                "- Remove secrets from your commits",
+                "- Use GitHub Secrets or environment variables instead",
+                "- Consider using `git filter-branch` or BFG to purge history",
+                "",
+                "> **Do not merge this PR until secrets are removed.**"
+              );
             }
-            lines.push("", `> _Auto-generated by PR Validator · commit \`${{ github.sha }}\`_`);
-            const body = lines.join("\n");
+            lines_body.push("", "_Auto-generated by PR Validator Agent_");
+            const body = lines_body.join("\n");
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner, repo: context.repo.repo,

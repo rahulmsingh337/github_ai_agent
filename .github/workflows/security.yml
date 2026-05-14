@@ -2,13 +2,26 @@ name: 🔒 Security Agent
 
 on:
   schedule:
-    - cron: "0 2 * * 1"  # Every Monday at 2:00 AM UTC
+    - cron: "0 2 * * 1"  # Every Monday 2 AM UTC
   push:
     paths:
       - "package.json"
       - "package-lock.json"
+      - "yarn.lock"
+      - "pnpm-lock.yaml"
       - "requirements.txt"
       - "pyproject.toml"
+      - "Pipfile"
+      - "Pipfile.lock"
+      - "go.mod"
+      - "go.sum"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pom.xml"
+      - "build.gradle"
+      - "build.gradle.kts"
+      - "Gemfile"
+      - "Gemfile.lock"
   workflow_dispatch:
 
 permissions:
@@ -21,106 +34,199 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── Language Detection ─────────────────────────────────
+      - name: Detect package ecosystems
+        id: detect
+        run: |
+          has_node=false; has_python=false; has_go=false
+          has_rust=false; has_ruby=false
+
+          [ -f package-lock.json ] || [ -f yarn.lock ] || [ -f pnpm-lock.yaml ] && has_node=true
+          [ -f requirements.txt ] || [ -f Pipfile ] || [ -f pyproject.toml ]    && has_python=true
+          [ -f go.sum ]           && has_go=true
+          [ -f Cargo.lock ]       && has_rust=true
+          [ -f Gemfile.lock ]     && has_ruby=true
+
+          echo "has_node=$has_node"     >> $GITHUB_OUTPUT
+          echo "has_python=$has_python" >> $GITHUB_OUTPUT
+          echo "has_go=$has_go"         >> $GITHUB_OUTPUT
+          echo "has_rust=$has_rust"     >> $GITHUB_OUTPUT
+          echo "has_ruby=$has_ruby"     >> $GITHUB_OUTPUT
+
+      # ── Node.js: npm audit ────────────────────────────────
       - name: Setup Node.js
-        if: hashFiles('package.json') != ''
+        if: steps.detect.outputs.has_node == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
+      - name: npm audit
+        id: npm_audit
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if [ -f package-lock.json ]; then npm ci --prefer-offline --quiet
+          elif [ -f yarn.lock ];       then npm install -g yarn --quiet && yarn install --frozen-lockfile --silent
+          elif [ -f pnpm-lock.yaml ];  then npm install -g pnpm --quiet && pnpm install --frozen-lockfile --silent
+          else npm install --quiet; fi
+
+          npm audit --json > /tmp/npm-audit.json 2>&1 || true
+          VULNS=$(python3 -c "
+import json
+try:
+    d = json.load(open('/tmp/npm-audit.json'))
+    v = d.get('metadata',{}).get('vulnerabilities',{})
+    print(v.get('total', sum(v.values()) if v else 0))
+except: print(0)
+          ")
+          echo "count=$VULNS" >> $GITHUB_OUTPUT
+          echo "npm vulnerabilities: $VULNS"
+        continue-on-error: true
+
+      # ── Python: pip-audit ─────────────────────────────────
       - name: Setup Python
+        if: steps.detect.outputs.has_python == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install pip-audit
-        run: pip install pip-audit --quiet
-
-      - name: Run npm audit
-        id: npm_audit
-        if: hashFiles('package-lock.json') != ''
-        run: |
-          npm ci --quiet
-          npm audit --json > /tmp/npm-audit.json 2>&1 || true
-          VULNS=$(python3 -c "
-          import json, sys
-          try:
-              d = json.load(open('/tmp/npm-audit.json'))
-              v = d.get('metadata', {}).get('vulnerabilities', {})
-              print(v.get('total', 0))
-          except:
-              print(0)
-          ")
-          echo "vulnerabilities=$VULNS" >> $GITHUB_OUTPUT
-          echo "npm vulnerabilities: $VULNS"
-        continue-on-error: true
-
-      - name: Run pip-audit
+      - name: pip-audit
         id: pip_audit
+        if: steps.detect.outputs.has_python == 'true'
         run: |
+          pip install pip-audit --quiet
           if [ -f requirements.txt ] && [ -s requirements.txt ]; then
             pip install -r requirements.txt --quiet 2>/dev/null || true
-            pip-audit --output=json > /tmp/pip-audit.json 2>&1 || true
-            VULNS=$(python3 -c "
-          import json
-          try:
-              d = json.load(open('/tmp/pip-audit.json'))
-              total = sum(len(dep.get('vulns', [])) for dep in d.get('dependencies', []))
-              print(total)
-          except:
-              print(0)
-            ")
-          else
-            VULNS=0
-            echo "No requirements.txt with content — skipping pip-audit"
+          elif [ -f pyproject.toml ]; then
+            pip install -e . --quiet 2>/dev/null || true
           fi
-          echo "vulnerabilities=$VULNS" >> $GITHUB_OUTPUT
+          pip-audit --output=json --skip-editable > /tmp/pip-audit.json 2>&1 || true
+          VULNS=$(python3 -c "
+import json
+try:
+    d = json.load(open('/tmp/pip-audit.json'))
+    print(sum(len(dep.get('vulns',[])) for dep in d.get('dependencies',[])))
+except: print(0)
+          ")
+          echo "count=$VULNS" >> $GITHUB_OUTPUT
           echo "pip vulnerabilities: $VULNS"
         continue-on-error: true
 
+      # ── Go: govulncheck ───────────────────────────────────
+      - name: Setup Go
+        if: steps.detect.outputs.has_go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: govulncheck
+        id: go_audit
+        if: steps.detect.outputs.has_go == 'true'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest 2>/dev/null || true
+          RESULT=$(govulncheck ./... 2>&1 || true)
+          VULNS=$(echo "$RESULT" | grep -c "Vulnerability #" || echo 0)
+          echo "count=$VULNS" >> $GITHUB_OUTPUT
+          echo "go vulnerabilities: $VULNS"
+        continue-on-error: true
+
+      # ── Rust: cargo audit ─────────────────────────────────
+      - name: Setup Rust
+        if: steps.detect.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo audit
+        id: rust_audit
+        if: steps.detect.outputs.has_rust == 'true'
+        run: |
+          cargo install cargo-audit --quiet 2>/dev/null || true
+          RESULT=$(cargo audit --json 2>/dev/null || echo '{"vulnerabilities":{"count":0}}')
+          VULNS=$(echo "$RESULT" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('vulnerabilities',{}).get('count',0))
+except: print(0)
+          ")
+          echo "count=$VULNS" >> $GITHUB_OUTPUT
+          echo "rust vulnerabilities: $VULNS"
+        continue-on-error: true
+
+      # ── Ruby: bundler-audit ───────────────────────────────
+      - name: Setup Ruby
+        if: steps.detect.outputs.has_ruby == 'true'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+
+      - name: bundler-audit
+        id: ruby_audit
+        if: steps.detect.outputs.has_ruby == 'true'
+        run: |
+          gem install bundler-audit --quiet
+          bundle-audit update --quiet
+          RESULT=$(bundle-audit check 2>&1 || true)
+          VULNS=$(echo "$RESULT" | grep -c "Name:" || echo 0)
+          echo "count=$VULNS" >> $GITHUB_OUTPUT
+          echo "ruby vulnerabilities: $VULNS"
+        continue-on-error: true
+
+      # ── Report ────────────────────────────────────────────
       - name: Create GitHub Issue if vulnerabilities found
         uses: actions/github-script@v7
         with:
           script: |
-            const npmVulns = parseInt("${{ steps.npm_audit.outputs.vulnerabilities }}") || 0;
-            const pipVulns = parseInt("${{ steps.pip_audit.outputs.vulnerabilities }}") || 0;
-            const total = npmVulns + pipVulns;
-
+            const counts = {
+              npm:    parseInt("${{ steps.npm_audit.outputs.count }}")    || 0,
+              pip:    parseInt("${{ steps.pip_audit.outputs.count }}")    || 0,
+              go:     parseInt("${{ steps.go_audit.outputs.count }}")     || 0,
+              rust:   parseInt("${{ steps.rust_audit.outputs.count }}")   || 0,
+              ruby:   parseInt("${{ steps.ruby_audit.outputs.count }}")   || 0,
+            };
+            const total = Object.values(counts).reduce((a, b) => a + b, 0);
             if (total === 0) {
-              console.log("✅ No vulnerabilities found — no issue created");
+              console.log("✅ No vulnerabilities found across all ecosystems");
               return;
             }
 
             const date = new Date().toISOString().split("T")[0];
-            const title = `🔒 Security Alert: ${total} vulnerability/vulnerabilities detected — ${date}`;
+            const remediation = {
+              npm:  "`npm audit fix` or `npm audit fix --force`",
+              pip:  "`pip-audit --fix`",
+              go:   "`go get -u ./...` then `go mod tidy`",
+              rust: "`cargo update`",
+              ruby: "`bundle update`",
+            };
+
+            const rows = Object.entries(counts)
+              .filter(([, v]) => v > 0)
+              .map(([k, v]) => `| ${k} | ${v} | ${remediation[k]} |`)
+              .join("\n");
+
             const body = [
               "## 🔒 Security Scan Results",
               "",
-              "| Scanner | Vulnerabilities |",
-              "|---------|----------------|",
-              `| npm audit | ${npmVulns} |`,
-              `| pip-audit | ${pipVulns} |`,
-              `| **Total** | **${total}** |`,
+              `**Total vulnerabilities: ${total}**`,
               "",
-              "### Remediation",
-              "- Run `npm audit fix` to fix npm vulnerabilities",
-              "- Run `pip-audit --fix` to fix Python vulnerabilities",
-              "- Review manually for breaking changes before auto-fixing",
+              "| Ecosystem | Count | Remediation |",
+              "|-----------|-------|-------------|",
+              rows,
+              "",
+              "### How to fix",
+              ...Object.entries(counts).filter(([,v])=>v>0).map(([k])=>`- **${k}:** run ${remediation[k]}`),
               "",
               `> Auto-generated by Security Agent on ${date}`
             ].join("\n");
 
-            // Check for existing open security issue today to avoid duplicates
             const { data: issues } = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
               state: "open", labels: "security"
             });
-            const todayIssue = issues.find(i => i.title.includes(date));
-            if (todayIssue) {
-              console.log("Security issue already exists for today — skipping");
+            if (issues.find(i => i.title.includes(date))) {
+              console.log("Issue already created today — skipping");
               return;
             }
-
             await github.rest.issues.create({
               owner: context.repo.owner, repo: context.repo.repo,
-              title, body, labels: ["security", "automated"]
+              title: `🔒 Security Alert: ${total} vulnerabilities detected — ${date}`,
+              body, labels: ["security", "automated"]
             });

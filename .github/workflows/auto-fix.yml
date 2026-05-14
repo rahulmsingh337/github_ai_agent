@@ -15,55 +15,131 @@ jobs:
   auto-fix:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── Language Detection ─────────────────────────────────
+      - name: Detect languages
+        id: detect
+        run: |
+          has_node=false; has_python=false; has_go=false; has_rust=false
+
+          [ -f package.json ] && has_node=true
+          [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f setup.py ] && has_python=true
+          [ -f go.mod ]   && has_go=true
+          [ -f Cargo.toml ] && has_rust=true
+
+          PY=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" | head -1)
+          [ -n "$PY" ] && has_python=true
+
+          echo "has_node=$has_node"     >> $GITHUB_OUTPUT
+          echo "has_python=$has_python" >> $GITHUB_OUTPUT
+          echo "has_go=$has_go"         >> $GITHUB_OUTPUT
+          echo "has_rust=$has_rust"     >> $GITHUB_OUTPUT
+          echo "Detected → node:$has_node python:$has_python go:$has_go rust:$has_rust"
+
+      # ── Node.js: Prettier ──────────────────────────────────
       - name: Setup Node.js
-        if: hashFiles('package.json') != ''
+        if: steps.detect.outputs.has_node == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
 
+      - name: Install Node deps
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if [ -f package-lock.json ]; then npm ci --prefer-offline
+          elif [ -f yarn.lock ];       then npm install -g yarn && yarn install --frozen-lockfile
+          else npm install; fi
+
+      - name: Run Prettier
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if grep -q '"prettier"' package.json 2>/dev/null || [ -f .prettierrc ] || \
+             [ -f .prettierrc.json ] || [ -f .prettierrc.js ] || [ -f prettier.config.js ]; then
+            npx prettier --write "**/*.{js,jsx,ts,tsx,mjs,cjs,json,css,scss,md,yml,yaml}" \
+              --ignore-path .gitignore 2>/dev/null || \
+            npx prettier --write "**/*.{js,jsx,ts,tsx,json,css,md}" || true
+          else
+            npx prettier --write "**/*.{js,jsx,ts,tsx,json,css,scss,md}" \
+              --ignore-path .gitignore 2>/dev/null || true
+          fi
+          echo "✅ Prettier done"
+
+      - name: Run ESLint fix
+        if: steps.detect.outputs.has_node == 'true'
+        run: |
+          if [ -f .eslintrc.js ] || [ -f .eslintrc.json ] || [ -f .eslintrc.yml ] || \
+             [ -f .eslintrc.yaml ] || [ -f .eslintrc.cjs ] || [ -f eslint.config.js ] || \
+             grep -q '"eslint"' package.json 2>/dev/null; then
+            npx eslint . --ext .ts,.tsx,.js,.jsx,.mjs --fix --max-warnings 99999 || true
+          fi
+          echo "✅ ESLint fix done"
+
+      # ── Python: Ruff ───────────────────────────────────────
       - name: Setup Python
+        if: steps.detect.outputs.has_python == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install formatters
+      - name: Run Ruff fix
+        if: steps.detect.outputs.has_python == 'true'
         run: |
-          [ -f package-lock.json ] && npm ci || true
           pip install ruff --quiet
+          ruff check . --fix --unsafe-fixes || true
+          ruff format . || true
+          echo "✅ Ruff fix done"
 
-      - name: Run Ruff auto-fix
+      # ── Go: gofmt ─────────────────────────────────────────
+      - name: Setup Go
+        if: steps.detect.outputs.has_go == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Run gofmt
+        if: steps.detect.outputs.has_go == 'true'
         run: |
-          PY_FILES=$(find . -name "*.py" ! -path "*/node_modules/*" ! -path "*/.git/*" | head -1)
-          if [ -n "$PY_FILES" ]; then
-            ruff check . --fix --unsafe-fixes || true
-            ruff format . || true
-            echo "Ruff fixes applied"
-          else
-            echo "No Python files — skipping Ruff"
-          fi
+          gofmt -w $(find . -name "*.go" ! -path "*/vendor/*" ! -path "*/.git/*")
+          go mod tidy || true
+          echo "✅ gofmt done"
 
-      - name: Run Prettier
-        if: hashFiles('package.json') != ''
+      # ── Rust: rustfmt ─────────────────────────────────────
+      - name: Setup Rust
+        if: steps.detect.outputs.has_rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run rustfmt
+        if: steps.detect.outputs.has_rust == 'true'
         run: |
-          npx prettier --write "**/*.{js,jsx,ts,tsx,json,css,md}" \
-            --ignore-path .gitignore 2>/dev/null || true
+          cargo fmt --all || true
+          echo "✅ rustfmt done"
 
+      # ── Commit all fixes ───────────────────────────────────
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --staged --quiet; then
-            echo "✅ No formatting changes needed"
+            echo "✅ No formatting changes needed — repo is already clean"
           else
-            git commit -m "style: auto-fix formatting (Ruff + Prettier)"
+            CHANGED=$(git diff --staged --name-only | wc -l)
+            git commit -m "style: auto-fix formatting across $CHANGED file(s)
+
+Applied formatters:
+- Node.js: Prettier + ESLint --fix
+- Python:  Ruff check --fix + ruff format
+- Go:      gofmt + go mod tidy
+- Rust:    cargo fmt
+
+[skip ci]"
             git push
-            echo "✅ Fixes committed and pushed"
+            echo "✅ $CHANGED file(s) fixed and pushed"
           fi
